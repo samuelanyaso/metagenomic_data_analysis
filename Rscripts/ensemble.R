@@ -1,37 +1,32 @@
-packages <- c("randomForest","xgboost","e1071","caret","glmnet",
-              "MASS","neuralnet","pROC","stringr","doParallel","foreach",
-              "RankAggreg","class","adabag","rpart","plsgenomics",
-              "penalized","measures","pROC","UBL","keras","mlr")
+packages <- c("ranger","xgboost","e1071","caret","glmnet",
+              "MASS","pROC","stringr","doParallel","foreach",
+              "RankAggreg","class","adabag","rpart","plsgenomics","recipes",
+              "penalized","measures","keras","mlr","dplyr")
 lapply(packages, require, character.only = TRUE)
-
 
 source("validation.R")
 
 ##################################################################################################
 ## Construction of an ensemble of standard classifiers.
 ##################################################################################################
-
 ensembleClassifier <- function(x, y, M=51, fit.individual=TRUE, varimp=FALSE, rfs=FALSE, nf=ceiling(sqrt(ncol(x))),
                                levsChar, train=NULL, test=NULL,
-                               algorithms=c("svm", "rf","rf001","rf002","rf003","rang",
+                               algorithms=c("svm","rang",
                                             "pls_rf", "pca_rf", "rpart", "pls_rpart",
-                                            "adaboost","pls_adaboost","xgb","pls_xgb","mlp"), 
-                               validation=c("accuracy", "kappa", "sensitivity"), 
+                                            "pls_adaboost","xgb","pls_xgb","mlp"), 
+                               validation=c( "G_mean","auc","kappa"), 
                                ncomp=5, nunits=3, lambda1=5, kernel="radial",num.trees = 1500,
                                distance="Spearman", weighted=TRUE, verbose=TRUE, seed=NULL, ...){
 
   rownames(x) <- NULL # to suppress the warning message about duplicate rownames
-  
   if(!is.null(seed)){
     set.seed(seed)
   }
-  
   if(length(algorithms) < 2){
     stop("Ensemble classifier needs at least 2 classification algorithms")
   }
-  
   n <- length(y)
-  ncla <- length(unique(y))
+  num.class <- length(unique(y))
   nalg <- length(algorithms)
   nvm <- length(validation)
   ly <- levels(y)
@@ -45,14 +40,12 @@ ensembleClassifier <- function(x, y, M=51, fit.individual=TRUE, varimp=FALSE, rf
   varImportance <- NULL
   
   for(k in 1:M){
-    
     repeat{
       # obtain bootstrap resamples. To make sure each class is represented at least once
       s <- sample(n,replace = TRUE)
-      if(length(table(y[unique(s)])) == ncla & length(table(y[-s])) == ncla)
+      if(length(table(y[unique(s)])) == num.class & length(table(y[-s])) == num.class)
         break
     }
-    
     if(rfs){
       # perform feature selection?
       fs <- sample(1:ncol(x), nf)
@@ -68,15 +61,15 @@ ensembleClassifier <- function(x, y, M=51, fit.individual=TRUE, varimp=FALSE, rf
     truthChar <- num2charFac(truth,char.levs = levsChar)
     
     ## For MLP::Tranform labels to One-Hot Encoded labels
-    trainLabels <- to_categorical(trainY, num_classes = ncla)
-    testLabels <- to_categorical(truth, num_classes = ncla)
+    trainLabels <- to_categorical(trainY, num_classes = num.class)
+    testLabels <- to_categorical(truth, num_classes = num.class)
     colnames(trainLabels) <- ly
     colnames(testLabels) <- ly
 
     # construct PLS latent variables (store in plsX) if one of the PLS methods is used
     # this method is taken form library CMA (bioconductor)
-    if("pls_lda" %in% algorithms || "pls_xgb" %in% algorithms || "pls_rf" %in% algorithms ||
-       "pls_lr" %in% algorithms){
+    if("pls_rpart" %in% algorithms || "pls_xgb" %in% algorithms || "pls_rf" %in% algorithms ||
+       "pls_adaboost" %in% algorithms){
       if(ncomp >= ncol(x))
         stop("Decrease ncomp for the PLS models; must be smaller than ncol(x)")
       fpr <- pls.regression(training, transformy(trainY), ncomp = ncomp,unit.weights = TRUE)
@@ -85,35 +78,28 @@ ensembleClassifier <- function(x, y, M=51, fit.individual=TRUE, varimp=FALSE, rf
     }
     
     # construct PCA latent variables (store in pcaX)
-    if("pca_lda" %in% algorithms || "pca_qda" %in% algorithms || "pca_rf" %in% algorithms ||
-       "pca_lr" %in% algorithms){
+    if("pca_rf" %in% algorithms){
       if(ncomp >= ncol(x))
         stop("Decrease ncomp for the PLS models; must be smaller than ncol(x)")
-      pcaX <- prcomp(training)$x[,1:ncomp]
-      pcaTestX <- prcomp(testing)$x[,1:ncomp]
+      pcaX <- prcomp(training, scale. = FALSE,)$x[,1:ncomp]
+      pcaTestX <- prcomp(testing, scale. = FALSE)$x[,1:ncomp]
     }
+    #########################################################################
+    ## Creates the xgBoost learner with MLR package
     
-    # Construct mlr tasks
+    # Construct MLR tasks
     dat.train <- data.frame(class=trainYChar, training)
     dat.test <- data.frame(class=truthChar, testing)
-    
     #convert characters to factors
     fact_col <- colnames(dat.train)[sapply(dat.train,is.character)]
-    
     for(i in fact_col) set(dat.train,j=i,value = factor(dat.train[[i]]))
     for (i in fact_col) set(dat.test,j=i,value = factor(dat.test[[i]]))
-    
     #create tasks
     traintask <- makeClassifTask (data = dat.train,target = "class")
     testtask <- makeClassifTask (data = dat.test,target = "class")
-    
     #do one hot encoding
     traintask <- createDummyFeatures (obj = traintask)
     testtask <- createDummyFeatures (obj = testtask)
-    
-
-    #########################################################################
-    ## Creates the xgBoost learner with MLR package
     
     xgblrn <- makeLearner("classif.xgboost",predict.type = "prob")
     xgblrn$par.vals <- list(objective="multi:softprob",
@@ -126,18 +112,17 @@ ensembleClassifier <- function(x, y, M=51, fit.individual=TRUE, varimp=FALSE, rf
     
     ## Function to fit the multi-layer perceptron model
     MLP <- 
-      function(x,training,trainLabels,wghts.nn,resamp.case.wghts,file_name){
+      function(training,trainLabels,wghts.nn=NULL,resamp.case.wghts=NULL,file_name){
         ## Initialize a sequential model
         keras.mod <- keras_model_sequential()  %>% 
           # Add layers to the model
-          layer_dense(units = 200, activation = "relu", input_shape = c(ncol(x))) %>% 
+          layer_dense(units = 200, activation = "relu", input_shape = c(ncol(training))) %>% 
           layer_dense(units = 23, activation = "softmax")
         
         # compile the model
         keras.mod %>% compile(loss = 'categorical_crossentropy',
                               optimizer = "adam",
                               metrics = "accuracy")
-        
         # fits the model
         keras.mod %>% fit(training,
                           trainLabels,
@@ -147,34 +132,26 @@ ensembleClassifier <- function(x, y, M=51, fit.individual=TRUE, varimp=FALSE, rf
                           class_weight = wghts.nn,
                           sample_weight = resamp.case.wghts,
                           verbose=0)
-        
         # saves the model
         keras.mod %>% save_model_hdf5(file_name)
-        
         return(keras.mod)
       }
-    
-    
+
     #############################################################################
     #### Begins parallel computation
     #############################################################################
-    
     cores <- detectCores()
     cl <- makeCluster(cores - 1)
     registerDoParallel(cl)
     
     Res <- list()
     oper <- 
-      foreach(j = 1:(nalg), .combine='comb', .multicombine=TRUE, .init=list(list(), list()),.export = c("xgb_lrn_tune","traintask","xgb_params","brierSummary"),
-              .packages = c("randomForest","ranger","xgboost","e1071","caret","glmnet","MASS","pROC","stringr","RankAggreg","class",
+      foreach(j = 1:(nalg), .combine='comb', .multicombine=TRUE, .init=list(list(), list()),.export = c("xgb_lrn_tune","traintask","xgb_params"),
+              .packages = c("ranger","xgboost","e1071","caret","glmnet","MASS","pROC","stringr","RankAggreg","class",
                             "adabag","rpart","plsgenomics","penalized","measures","plyr","recipes","dplyr","keras"))  %dopar% {
                               res <- switch(algorithms[j],
-                                            "svm" = suppressWarnings(svm(training, trainY, probability = T, kernel = kernel)),
-                                            "rf" = ranger(x=training,y=trainY),
-                                            "rf001" = ranger(x=training,y=trainY,num.trees = 1500, mtry = 34),
-                                            "rf002" = ranger(x=training,y=trainY,num.trees = 500, mtry = 37),
-                                            "rf003" = ranger(x=training,y=trainY,num.trees = 1000, mtry = 41),
-                                            "rang" = ranger(x=training,y=trainY,num.trees = 1500, mtry = 46),
+                                            "svm" = suppressWarnings(svm(training, trainY, probability = T, kernel = kernel, scale = FALSE)),
+                                            "rang" = ranger(x=training,y=trainY,num.trees = 1500),
                                             "pls_rf" = ranger(x=as.data.frame(plsX), y=trainY),
                                             "pca_rf" = ranger(x=as.data.frame(pcaX), y=trainY),
                                             "rpart" = rpart(y~., data=data.frame(y=trainY,training),method = "class"),
@@ -184,43 +161,38 @@ ensembleClassifier <- function(x, y, M=51, fit.individual=TRUE, varimp=FALSE, rf
                                             "xgb" = mlr::train(learner = xgb_lrn_tune,task = traintask),
                                             "pls_xgb" = xgb.train(params = xgb_params, data = xgb.DMatrix(plsX, label=c(as.numeric(trainY)-1)),
                                                                   nrounds = 50),
-                                            "mlp" = MLP(x = x,training = training,trainLabels = trainLabels,
+                                            "mlp" = MLP(training = training,trainLabels = trainLabels,
                                                         wghts.nn = NULL,resamp.case.wghts = NULL,file_name="dl_ens_time.h5")
                               )
                               list(res, algorithms[j])
                             }
     stopCluster(cl)
-    
     # Calls the saved & fitted MLP model
     keras.mod <- load_model_hdf5("dl_ens_time.h5")
-    
     Res <- oper[[1]]
+    
+    if(verbose)
+      cat("Trained all classification models: ",k,"/",M,"\n ")
     
     for(j in 1:nalg){
       attr(Res[[j]], "algorithm") <- algorithms[j]
-      if("pls_lda" == algorithms[j] || "pls_qda" == algorithms[j] || "pls_rf" == algorithms[j] ||
+      if("pls_rf" == algorithms[j] ||
          "pls_xgb" == algorithms[j] || 
          "pls_adaboost" == algorithms[j] || "pls_rpart" == algorithms[j]){
         attr(Res[[j]], "meanX") <- fpr$meanX
         attr(Res[[j]], "R") <- fpr$R
       }
-      if("pca_lda" == algorithms[j] || "pca_qda" == algorithms[j] || 
-         "pca_rf" == algorithms[j]){
+      if("pca_rf" == algorithms[j]){
         attr(Res[[j]], "ncomp") <- ncomp
       }
     }
     
     # predict using fitted models on oob 
     predicted <- list()
-    probs <- list()
     for(j in 1:nalg){
       switch(algorithms[j],
              "svm" = {pred <-  predict(Res[[j]], testing, prob=TRUE)
              predicted[[j]] <- pred},
-             "rf" = {predicted[[j]] <- predict(Res[[j]], testing)$predictions},
-             "rf001" = {predicted[[j]] <-predict(Res[[j]], testing)$predictions},
-             "rf002" = {predicted[[j]] <- predict(Res[[j]], testing)$predictions},
-             "rf003" = {predicted[[j]] <- predict(Res[[j]], testing)$predictions},
              "rang" = {predicted[[j]] <- predict(Res[[j]], testing)$predictions},
              "pls_rf" = {predicted[[j]] <- predict(Res[[j]], as.data.frame(plsTestX))$predictions},
              "pca_rf" = {predicted[[j]] <- predict(Res[[j]], as.data.frame(pcaTestX))$predictions},
@@ -231,7 +203,7 @@ ensembleClassifier <- function(x, y, M=51, fit.individual=TRUE, varimp=FALSE, rf
              "xgb" = {xgpred <- predict(Res[[j]],testtask)
              predicted[[j]] <- factor(as.numeric(xgpred$data$response)-1, levels=ly)},
              "pls_xgb" = {pred <- predict(Res[[j]], newdata=xgb.DMatrix(plsTestX))
-             temp <- data.frame(t(matrix(pred, nrow = ncla, ncol=length(pred)/ncla)))
+             temp <- data.frame(t(matrix(pred, nrow = num.class, ncol=length(pred)/num.class)))
              names(temp) <- ly
              predicted[[j]] <- factor(as.numeric(apply(temp, 1, which.max))-1,levels=ly)},
              "mlp" = {predicted[[j]] <- factor(keras.mod %>% predict_classes(testing, batch_size = 128), levels=ly)}
@@ -245,11 +217,11 @@ ensembleClassifier <- function(x, y, M=51, fit.individual=TRUE, varimp=FALSE, rf
     for(i in 1:nalg){
       for(j in 1:nvm){
         scores[i,j] <- switch(validation[j],
-                              "accuracy" = accuracy(truth, factor(predicted[[i]], levels = ly)),
+                              # "accuracy" = accuracy(truth, factor(predicted[[i]], levels = ly)),
                               "kappa" = KAPPA(truth, factor(predicted[[i]], levels = ly)),
-                              "sensitivity" = sensitivity(truth, factor(predicted[[i]], levels = ly)),
+                              "G_mean" = MGmean(truth, factor(predicted[[i]], levels = ly)),
                               "auc" = as.numeric(multiclass.roc(as.numeric(truth), 
-                                                                as.numeric(factor(predicted[[i]], levels = ly)),quiet=T)$auc)
+                                                        as.numeric(factor(predicted[[i]], levels = ly)),quiet=T)$auc)
         )
       }
     }
@@ -275,6 +247,8 @@ ensembleClassifier <- function(x, y, M=51, fit.individual=TRUE, varimp=FALSE, rf
     }else{
       fittedModels[[k]] <- Res[[which.max(scores[,1])]]
     }
+    if(verbose)
+      cat("Completed rank aggregation for : ",k,"/",M,"\n ")
     
     ###############################################################################################
     # variable importance as in Random Forest
@@ -283,7 +257,7 @@ ensembleClassifier <- function(x, y, M=51, fit.individual=TRUE, varimp=FALSE, rf
       kalg <- attr(fittedModels[[k]], "algorithm")
       nts <- nrow(testing) # number of testing samples
       
-      if(!kalg %in% c("pls_lda", "pls_qda", "pls_rf","pca_lda", "pca_qda", "pca_rf","pls_rpart","pls_adaboost","pls_xgb")){
+      if(!kalg %in% c("pls_rf","pca_rf","pls_rpart","pls_adaboost","pls_xgb")){
         testingX <- testing
         testingY <- as.numeric(truth)
         
@@ -300,10 +274,6 @@ ensembleClassifier <- function(x, y, M=51, fit.individual=TRUE, varimp=FALSE, rf
           
           switch(kalg,
                  "svm"       = predicted[,i] <- as.character(predict(fittedModels[[k]], testing, prob=TRUE)),
-                 "rf"        = predicted[,i] <- as.character(predict(fittedModels[[k]], testing)$prediction),
-                 "rf001"     = predicted[,i] <- as.character(predict(fittedModels[[k]], testing)$prediction),
-                 "rf002"    = predicted[,i] <- as.character(predict(fittedModels[[k]], testing)$prediction),
-                 "rf003"    = predicted[,i] <- as.character(predict(fittedModels[[k]], testing)$prediction),
                  "rang"     = predicted[,i] <- as.character(predict(fittedModels[[k]], testing)$prediction),
                  "rpart"     = predicted[,i] <- as.character(predict(fittedModels[[k]], newdata=data.frame(testing), type="class")),
                  "adaboost"  = predicted[,i] <- as.character(as.numeric(predict(fittedModels[[k]], newdata=data.frame(testing))$class)),
@@ -313,7 +283,6 @@ ensembleClassifier <- function(x, y, M=51, fit.individual=TRUE, varimp=FALSE, rf
                  "mlp" = predicted[,i] <- as.character(factor(keras.mod %>% predict_classes(testing, batch_size = 128), levels=ly))
           )
         }
-        
         predicted <- apply(predicted,2,as.numeric)
         predicted <- predicted 
         
@@ -328,7 +297,7 @@ ensembleClassifier <- function(x, y, M=51, fit.individual=TRUE, varimp=FALSE, rf
 
     # some output
     if(verbose)
-      cat("Iter ", k, "\n")
+      cat("Completed iter : ",k,"/",M,"\n ")
   } # ends loop 1:M
   
   # how many times each algorithm was the best
@@ -341,43 +310,33 @@ ensembleClassifier <- function(x, y, M=51, fit.individual=TRUE, varimp=FALSE, rf
     colnames(varImportance) <- c("MeanDecreaseAcc", "StdMeanDecreaseAcc")
   }
   
-  
-  
   ###########################################################################
   # train all classifiers individually on all training data
   ###########################################################################
-  
   training <- x #train using all data
   trainY <- y
-  trainYChar <- num2charFac(y,char.levs = levsChar)
+  trainYChar <- num2charFac(trainY,char.levs = levsChar)
   
   ## Tranform labels to One-Hot Encoded labels
-  trainLabels <- to_categorical(trainY, num_classes = ncla)
+  trainLabels <- to_categorical(trainY, num_classes = num.class)
   colnames(trainLabels) <- ly
   
-  ## MLR setup
-  dat.train <- train
-  dat.test <- test
-  
+  # Construct mlr tasks
+  dat.train <- data.frame(class=trainYChar, training)
+
   #convert characters to factors
   fact_col <- colnames(dat.train)[sapply(dat.train,is.character)]
-  
   for(i in fact_col) set(dat.train,j=i,value = factor(dat.train[[i]]))
-  for (i in fact_col) set(dat.test,j=i,value = factor(dat.test[[i]]))
-  
+
   #create tasks
   traintask <- makeClassifTask (data = dat.train,target = "class")
-  testtask <- makeClassifTask (data = dat.test,target = "class")
-  
-  #do one hot encoding 
+  #do one hot encoding
   traintask <- createDummyFeatures (obj = traintask)
-  testtask <- createDummyFeatures (obj = testtask)
-  
-  
+
   if(fit.individual){
     # construct PLS latent variables (store in plsX) if one of the PLS methods used
     # this method is taken from library CMA (bioconductor)
-    if("pls_lda" %in% algorithms || "pls_qda" %in% algorithms || "pls_rf" %in% algorithms ||
+    if("pls_rpart" %in% algorithms || "pls_rf" %in% algorithms ||
        "pls_adaboost" %in% algorithms || "pls_xgb" %in% algorithms){
       if(ncomp >= ncol(x))
         stop("Decrease ncomp for the PLS models; must be smaller than ncol(x)")
@@ -386,10 +345,10 @@ ensembleClassifier <- function(x, y, M=51, fit.individual=TRUE, varimp=FALSE, rf
     }
     
     # construct PCA latent variables (store in pcaX)
-    if("pca_lda" %in% algorithms || "pca_qda" %in% algorithms || "pca_rf" %in% algorithms){
+    if("pca_rf" %in% algorithms){
       if(ncomp >= ncol(x))
         stop("Decrease ncomp for the PLS models; must be smaller than ncol(x)")
-      pcaX <- prcomp(x)$x[,1:ncomp]
+      pcaX <- prcomp(x, scale. = FALSE)$x[,1:ncomp]
     }  
     
     #############################################################################
@@ -402,16 +361,12 @@ ensembleClassifier <- function(x, y, M=51, fit.individual=TRUE, varimp=FALSE, rf
     registerDoParallel(cl)
     
     temp <- 
-      foreach(j = 1:nalg, .combine='comb', .multicombine=TRUE, .init=list(list(), list()),.export = c("xgb_lrn_tune","traintask","xgb_params","brierSummary"),
-              .packages = c("randomForest","ranger","xgboost","e1071","caret","glmnet","MASS","pROC","stringr","RankAggreg","class",
+      foreach(j = 1:nalg, .combine='comb', .multicombine=TRUE, .init=list(list(), list()),.export = c("xgb_lrn_tune","traintask","xgb_params"),
+              .packages = c("ranger","xgboost","e1071","caret","glmnet","MASS","pROC","stringr","RankAggreg","class",
                             "adabag","rpart","plsgenomics","penalized","measures","plyr","recipes","dplyr","keras"))  %dopar% {
                               res <- switch(algorithms[j],
-                                            "svm" = suppressWarnings(svm(training, trainY, probability = T, kernel = kernel)),
-                                            "rf" = ranger(x=training,y=trainY),
-                                            "rf001" = ranger(x=training,y=trainY,num.trees = 1500, mtry = 34),
-                                            "rf002" = ranger(x=training,y=trainY,num.trees = 500, mtry = 37),
-                                            "rf003" = ranger(x=training,y=trainY,num.trees = 1000, mtry = 41),
-                                            "rang" = ranger(x=training,y=trainY,num.trees = 1500, mtry = 46),
+                                            "svm" = suppressWarnings(svm(training, trainY, probability = T, kernel = kernel, scale = FALSE)),
+                                            "rang" = ranger(x=training,y=trainY,num.trees = 1500),
                                             "pls_rf" = ranger(x=as.data.frame(plsX), y=trainY),
                                             "pca_rf" = ranger(x=as.data.frame(pcaX), y=trainY),
                                             "rpart" = rpart(y~., data=data.frame(y=trainY,training),method = "class"),
@@ -421,7 +376,7 @@ ensembleClassifier <- function(x, y, M=51, fit.individual=TRUE, varimp=FALSE, rf
                                             "xgb" = mlr::train(learner = xgb_lrn_tune,task = traintask),
                                             "pls_xgb" = xgb.train(params = xgb_params, data = xgb.DMatrix(plsX, label=c(as.numeric(trainY)-1)),
                                                                   nrounds = 50),
-                                            "mlp" = MLP(x = x,training = training,trainLabels = trainLabels,
+                                            "mlp" = MLP(training = training,trainLabels = trainLabels,
                                                         wghts.nn = NULL,resamp.case.wghts = NULL,file_name="dl_ind_time.h5")
                               )
                               list(res, algorithms[j])
@@ -430,30 +385,25 @@ ensembleClassifier <- function(x, y, M=51, fit.individual=TRUE, varimp=FALSE, rf
     
     ## Stores the result
     Res <- temp[[1]]
+    names(Res) <- algorithms
     
     for(j in 1:nalg){
       attr(Res[[j]], "algorithm") <- algorithms[j]
-      if("pls_lda" == algorithms[j] || "pls_qda" == algorithms[j] || "pls_rf" == algorithms[j] ||
+      if("pls_rf" == algorithms[j] ||
          "pls_xgb" == algorithms[j] || 
          "pls_adaboost" == algorithms[j] || "pls_rpart" == algorithms[j]){
         attr(Res[[j]], "meanX") <- fpr$meanX
         attr(Res[[j]], "R") <- fpr$R
       }
-      if("pca_lda" == algorithms[j] || "pca_qda" == algorithms[j] || 
-         "pca_rf" == algorithms[j]){
+      if("pca_rf" == algorithms[j]){
         attr(Res[[j]], "ncomp") <- ncomp
       }
     }
   }
-  
   newFittedModels <- list()
   for(i in 1:M){
     newFittedModels[[i]] <- switch(bestAlg[i],
                                    "svm" = Res$svm,
-                                   "rf" = Res$rf,
-                                   "rf001" = Res$rf001,
-                                   "rf002" = Res$rf002,
-                                   "rf003" = Res$rf003,
                                    "rang" = Res$rang,
                                    "pls_rf" = Res$pls_rf,
                                    "pca_rf" = Res$pca_rf,
@@ -466,79 +416,64 @@ ensembleClassifier <- function(x, y, M=51, fit.individual=TRUE, varimp=FALSE, rf
                                    "mlp" = Res$mlp
     )
   }
-  
-  for(i in 1:M){
-    attr(newFittedModels[[i]], "algorithm") <- bestAlg[i]
-    if("pls_lda" == bestAlg[i] || "pls_qda" == bestAlg[i] || "pls_rf" == bestAlg[i] ||
-       "pls_xgb" == bestAlg[i] || "pls_adaboost" == bestAlg[i] ||
-       "pls_rpart" == bestAlg[i]){
-      attr(newFittedModels[[i]], "meanX") <- fpr$meanX
-      attr(newFittedModels[[i]], "R") <- fpr$R
-    }
-    if("pca_lda" == bestAlg[i] || "pca_qda" == bestAlg[i] ||
-       "pca_rf" == bestAlg[i])
-      attr(newFittedModels[[i]], "ncomp") <- ncomp
-  }
+  if(verbose)
+    cat("Fitting of individual models complete \n ")
   
   res <- list(models = newFittedModels, indModels = Res, rawImportance = rawImportance, M = M,
-              bestAlg = bestAlg, levels = ly, importance = varImportance, convScores = convScores)
+              bestAlg = bestAlg, levels = ly,levsChar=levsChar, importance = varImportance, convScores = convScores)
   class(res) <- "ensemble"
   res
 }
 
-
-
 ##################################################################################################
 ## Predict test test and evaluate model performance
 ##################################################################################################
-
 predictEns <- function(EnsObject, newdata, y=NULL, test=NULL, dlEnsPath, dlIndPath, plot=TRUE){
   ly <- EnsObject$levels
+  levsChar <- EnsObject$levsChar
   M <- EnsObject$M
   n <- nrow(newdata)
   predicted <- matrix(0, n, M)
   
+  # loads the keras models
   keras.ens <- load_model_hdf5(dlEnsPath)
   keras.ind <- load_model_hdf5(dlIndPath)
   
   for(i in 1:M){
-    # construct components for MLR setup
     testing <- newdata
+    rownames(testing) <- NULL
     
+    # Construct mlr tasks
     if(!is.null(y)){
-      dat.test <- test
+      testY <- y
+      testYChar <- num2charFac(testY,char.levs = levsChar)
+      dat.test <- data.frame(class=testYChar, testing)
     } else {
-      dat.test <- data.frame(class=factor(rep("MYS",nrow(testing))),testing)
+      # set class labels as unknown
+      dat.test <- data.frame(class=factor(rep("UNK",nrow(testing))),testing)
     }
     
     #convert characters to factors
     fact_col <- colnames(dat.test)[sapply(dat.test,is.character)]
-    
-    for (iii in fact_col) set(dat.test,j=iii,value = factor(dat.test[[iii]]))
+    for(iii in fact_col) set(dat.test,j=iii,value = factor(dat.test[[iii]]))
     
     #create tasks
     testtask <- makeClassifTask (data = dat.test,target = "class")
-    
     #do one hot encoding`<br/> 
     testtask <- createDummyFeatures (obj = testtask)
     
     # construct components for PLS and PCA
-    
-    if(attr(EnsObject$models[[i]], "algorithm") %in% c("pls_lda", "pls_qda", "pls_rf", "pls_rpart","pls_adaboost","pls_xgb")){
+    if(attr(EnsObject$models[[i]], "algorithm") %in% c("pls_rf", "pls_rpart","pls_adaboost","pls_xgb")){
       R <- attr(EnsObject$models[[i]], "R")
       meanX <- attr(EnsObject$models[[i]], "meanX")
       plsTestX <- scale(testing, scale=FALSE, center=meanX)%*%R
     }
-    if(attr(EnsObject$models[[i]], "algorithm") %in% c("pca_lda", "pca_qda", "pca_rf")){
-      pcaTestX <- prcomp(testing)$x[,1:as.numeric(attr(EnsObject$models[[i]], "ncomp"))]
+    if(attr(EnsObject$models[[i]], "algorithm") %in% c("pca_rf")){
+      pcaTestX <- prcomp(testing, scale. = FALSE)$x[,1:as.numeric(attr(EnsObject$models[[i]], "ncomp"))]
     }
     
     switch(attr(EnsObject$models[[i]], "algorithm"),
            "svm" = predicted[,i] <-  as.character(predict(EnsObject$models[[i]], testing, prob=TRUE)),
-           "rf" = predicted[,i] <- as.character(predict(EnsObject$models[[i]], testing)$prediction),
-           "rf001" = predicted[,i] <- as.character(predict(EnsObject$models[[i]], testing)$prediction),
-           "rf002" = predicted[,i] <- as.character(predict(EnsObject$models[[i]], testing)$prediction),
-           "rf003" = predicted[,i] <- as.character(predict(EnsObject$models[[i]], testing)$prediction),
            "rang"     = predicted[,i] <- as.character(predict(EnsObject$models[[i]], testing)$prediction),
            "pls_rf" = predicted[,i] <- as.character(predict(EnsObject$models[[i]], as.data.frame(plsTestX))$prediction),
            "pca_rf" = predicted[,i] <- as.character(predict(EnsObject$models[[i]], as.data.frame(pcaTestX))$prediction),
@@ -549,7 +484,7 @@ predictEns <- function(EnsObject, newdata, y=NULL, test=NULL, dlEnsPath, dlIndPa
            "xgb" = {xgpred <- predict(EnsObject$models[[i]],testtask)
            predicted[,i] <- as.character(factor(as.numeric(xgpred$data$response)-1, levels=ly))},
            "pls_xgb" = {pred <- predict(EnsObject$models[[i]], newdata=xgb.DMatrix(plsTestX))
-           temp <- data.frame(t(matrix(pred, nrow = ncla, ncol=length(pred)/ncla)))
+           temp <- data.frame(t(matrix(pred, nrow = num.class, ncol=length(pred)/num.class)))
            names(temp) <- ly
            predicted[,i] <- as.character(factor(as.numeric(apply(temp, 1, which.max))-1,levels=ly))},
            "mlp" = predicted[,i] <- as.character(factor(keras.ens %>% predict_classes(testing, batch_size = 128), levels=ly))
@@ -563,45 +498,39 @@ predictEns <- function(EnsObject, newdata, y=NULL, test=NULL, dlEnsPath, dlIndPa
   
   res <- list()
   if(!is.null(y)){
-    valM <- c("accuracy","sensitivity","kappa", "auc")
+    valM <- c("accuracy","G_mean","kappa", "auc")
     nvalM <- length(valM)
     acc <- accuracy(y, newclass)
-    sens <- sensitivity(y, newclass)
+    G_mean <- MGmean(y, newclass)
     kappa = KAPPA(y, newclass)
     auc <-  as.numeric(multiclass.roc(as.numeric(y), 
                                       as.numeric(newclass),quiet=T)$auc)
-    ensemblePerformance <- matrix(c(acc,sens,kappa,auc),1,nvalM)
+    ensemblePerformance <- matrix(c(acc,G_mean,kappa,auc),1,nvalM)
     colnames(ensemblePerformance) <- valM
     rownames(ensemblePerformance) <- "ensemble"
   }
-  
   
   #############################################################################
   # predict using individual models
   #############################################################################
   if(length(EnsObject$indModels) > 0){
     indPred <- matrix(0, nrow(newdata), length(EnsObject$indModels))
-    indProb <- list()
     testing <- newdata
     
     for(i in 1:length(EnsObject$indModels)){
       # constract components for PLS and PCA
-      if(attr(EnsObject$indModels[[i]], "algorithm") %in% c("pls_lda","pls_qda","pls_rf","pls_rpart","pls_adaboost","pls_xgb")){
+      if(attr(EnsObject$indModels[[i]], "algorithm") %in% c("pls_rf","pls_rpart","pls_adaboost","pls_xgb")){
         R <- attr(EnsObject$indModels[[i]], "R")
         meanX <- attr(EnsObject$indModels[[i]], "meanX")
         plsTestX <- scale(testing, scale=FALSE, center=meanX)%*%R
       }
-      if(attr(EnsObject$indModels[[i]], "algorithm") %in% c("pca_lda", "pca_qda", "pca_rf", "pca_lr")){
-        pcaTestX <- prcomp(testing)$x[,1:as.numeric(attr(EnsObject$indModels[[i]], "ncomp"))]
+      if(attr(EnsObject$indModels[[i]], "algorithm") %in% c("pca_rf")){
+        pcaTestX <- prcomp(testing, scale. = FALSE)$x[,1:as.numeric(attr(EnsObject$indModels[[i]], "ncomp"))]
       }
       
       switch(attr(EnsObject$indModels[[i]], "algorithm"),
              "svm" = {pred <-  predict(EnsObject$indModels[[i]], testing, prob=TRUE)
              indPred[,i] <- as.character(pred)},
-             "rf" = {indPred[,i] <- as.character(predict(EnsObject$indModels[[i]], testing)$prediction)},
-             "rf001" = {indPred[,i] <- as.character(predict(EnsObject$indModels[[i]], testing)$prediction)},
-             "rf002" = {indPred[,i] <- as.character(predict(EnsObject$indModels[[i]], testing)$prediction)},
-             "rf003" = {indPred[,i] <- as.character(predict(EnsObject$indModels[[i]], testing)$prediction)},
              "rang"     = {indPred[,i] <- as.character(predict(EnsObject$indModels[[i]], testing)$prediction)},
              "pls_rf" = {indPred[,i] <- as.character(predict(EnsObject$indModels[[i]], as.data.frame(plsTestX))$prediction)},
              "pca_rf" = {indPred[,i] <- as.character(predict(EnsObject$indModels[[i]], as.data.frame(pcaTestX))$prediction)},
@@ -612,17 +541,15 @@ predictEns <- function(EnsObject, newdata, y=NULL, test=NULL, dlEnsPath, dlIndPa
              "xgb" = {xgpred <- predict(EnsObject$indModels[[i]],testtask)
              indPred[,i] <- as.character(factor(as.numeric(xgpred$data$response)-1, levels=ly))},
              "pls_xgb" = {pred <- predict(EnsObject$indModels[[i]], newdata=xgb.DMatrix(plsTestX))
-             temp <- data.frame(t(matrix(pred, nrow = ncla, ncol=length(pred)/ncla)))
+             temp <- data.frame(t(matrix(pred, nrow = num.class, ncol=length(pred)/num.class)))
              names(temp) <- ly
-             #indProb[[i]] <- temp
              indPred[,i] <- as.character(factor(as.numeric(apply(temp, 1, which.max))-1,levels=ly))},
              "mlp" = {indPred[,i] <- as.character(factor(keras.ind %>% predict_classes(testing, batch_size = 128), levels=ly))}
       )
     }
-    
     indPred <- apply(indPred,2,as.numeric)
     
-    valM <- c("accuracy","sensitivity","kappa","auc")
+    valM <- c("accuracy","G_mean","kappa","auc")
     nvalM <- length(valM)
     
     if(!is.null(y)){
@@ -635,7 +562,7 @@ predictEns <- function(EnsObject, newdata, y=NULL, test=NULL, dlEnsPath, dlIndPa
         for(j in 1:nvalM)
           indPerformance [i,j] <- switch(valM[j],
                                          "accuracy" = accuracy(truth, factor(indPred[,i], levels=EnsObject$levels)),
-                                         "sensitivity" = sensitivity(truth, factor(indPred[,i], levels=EnsObject$levels)),
+                                         "G_mean" = MGmean(truth, factor(indPred[,i], levels=EnsObject$levels)),
                                          "kappa" = KAPPA(truth, factor(indPred[,i], levels=EnsObject$levels)),
                                          "auc" = as.numeric(multiclass.roc(as.numeric(truth), 
                                                                            as.numeric(factor(indPred[,i], levels = EnsObject$levels)),quiet=T)$auc)
@@ -656,8 +583,4 @@ predictEns <- function(EnsObject, newdata, y=NULL, test=NULL, dlEnsPath, dlIndPa
   class(res) <- "predictEnsemble"
   res
 }
-
-
-
-
 

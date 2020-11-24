@@ -6,18 +6,11 @@
 #SBATCH --mail-user=name@email.com      # Where to send email	
 #SBATCH --ntasks=1                    	# Run on a single machine (node)
 #SBATCH --cpus-per-task 30		  		# Run on a several CPU
-#SBATCH --mem-per-cpu=500mb             # Memory limit
+#SBATCH --mem-per-cpu=2gb	            # Memory limit
 #SBATCH --time=01:00:00               	# Time: hrs:min:sec
-#SBATCH --output=serial_test_%j.out   	# Output and error log 
+#SBATCH --output=output_%j.out   		# Output and error log 
 
 pwd; hostname; date 
-
-
-##################################################################################
-# Download Trimmomatic and adapter sequence files
-curl -LO http://www.usadellab.org/cms/uploads/supplementary/Trimmomatic/Trimmomatic-0.36.zip
-unzip Trimmomatic-0.36.zip
-##################################################################################
 
 
 # ############################################################
@@ -36,8 +29,6 @@ cd /where/to/save/the/database
 # Downloads the Homo_Sapiens database
 kneaddata_database --download human_genome bowtie2 ./
 
-echo "Running kneaddata script on several CPU cores" 
-
 cd /path/to/pair_end/fastq/files
 mkdir kneaddata_output
 
@@ -53,9 +44,9 @@ echo "Preprocessing ${f}"
 
 # removal of contaminated reads and trimming
 kneaddata -i ${f}_1.fastq -i ${f}_2.fastq -o kneaddata_output \
--db /path/to/database --trimmomatic /path/to/Trimmomatic-0.36 \
--t 30 --trimmomatic-options "ILLUMINACLIP:/path/to/adapter/sequence/file:2:30:10:8:keepBothReads SLIDINGWINDOW:4:30 MINLEN:60" \
---bowtie2-options "--very-sensitive --dovetail"  
+	-db /path/to/database --trimmomatic /path/to/Trimmomatic-0.36 \
+	-t 30 --trimmomatic-options "ILLUMINACLIP:/path/to/adapter/sequence/file:2:30:10:8:keepBothReads SLIDINGWINDOW:4:30 MINLEN:60" \
+	--bowtie2-options "--very-sensitive --dovetail"  
 
 echo "Finished preprocessing ${f}"
 done
@@ -63,11 +54,10 @@ done
 
 echo "KneadData QCing complete"
 
-# Process all of our KneadData log files and creates a nice 
-# summary table with the counts of reads after each step
+# Process all KneadData log files and creates a nice 
+# summary table with the counts of reads after each step.
 # Takes the kneaddata_output directory as input, output is .txt file
 kneaddata_read_count_table --input kneaddata_output --output kneaddata_read_counts.txt
-
 
 date
 

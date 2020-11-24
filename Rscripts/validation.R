@@ -1,22 +1,7 @@
-multiResultClass <- function(result1=NULL,result2=NULL,result3=NULL,result4=NULL,result5=NULL){
-  me <- list(
-    result1 = result1,
-    result2 = result2,
-    result3 = result3,
-    result4 = result4,
-    result5 = result5
-  )
-  ## set the name for the class
-  class(me) <- append(class(me), "multiclass")
-  return(me)
-}
-
-
 comb <- function(x, ...) {
   lapply(seq_along(x),
          function(i) c(x[[i]], lapply(list(...), function(y) y[[i]])))
 }
-
 
 predict.pls <- function(mod, newdata){
   # get the yhat from the pls regression in mod
@@ -42,6 +27,18 @@ specificity <- function(truth, predicted)
     sum(predicted[truth==0]==0)/sum(truth==0)   else
       return(0)
 
+# The multiclass adaptation of the G-mean as defined by Sun et al. 2006
+MGmean <- function(truth, predicted){
+  if(length(truth) > 0){
+    conf_mat <- caret::confusionMatrix(truth,predicted)
+    recall <- conf_mat$byClass[, "Recall"]
+    names(recall) <- NULL
+    MGmean <- (prod(recall,na.rm=TRUE))^(1/(length(recall) - sum(is.na(recall))) )
+    return(MGmean)
+  } else {
+    return(0)
+  }
+}
 
 convertScores <- function(scores){
   scores <- t(scores)
@@ -56,9 +53,9 @@ convertScores <- function(scores){
 }
 
 ## Function to compute mode
-getmode <- function(xx){
-  uniq <- unique(xx)
-  uniq[which.max(tabulate(match(xx, uniq)))]
+getmode <- function(x){
+  uniq <- unique(x)
+  uniq[which.max(tabulate(match(x, uniq)))]
 }
 
 # Function to return character factors rather than numeric factors
@@ -75,5 +72,10 @@ num2charFac <- function(y,char.levs){
   return(ytrain)
 }
 
-
-
+# Xgboost parameters
+xgb_params <- list(objective = "multi:softprob",
+                   eval_metric = "mlogloss",
+                   max_depth = 10,
+                   subsample = c(1),
+                   colsample_bytree = 1,
+                   num_class = num.class)

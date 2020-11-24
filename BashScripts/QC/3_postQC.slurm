@@ -6,9 +6,9 @@
 #SBATCH --mail-user=name@email.com      # Where to send email	
 #SBATCH --ntasks=1                    	# Run on a single machine (node)
 #SBATCH --cpus-per-task 30		  		# Run on a several CPU
-#SBATCH --mem-per-cpu=500mb             # Memory limit
+#SBATCH --mem-per-cpu=2gb             	# Memory limit
 #SBATCH --time=01:00:00               	# Time: hrs:min:sec
-#SBATCH --output=serial_test_%j.out   	# Output and error log 
+#SBATCH --output=output_%j.out   		# Output and error log 
 
 pwd; hostname; date 
 
@@ -36,6 +36,7 @@ cd /path/to/fastqc_out
 # Loads the multiQC program
 module load multiqc/1.7
 
+# The aggregation procedure
 multiqc *_fastqc.zip
 
 echo "post-QC analysis complete"
